@@ -27,6 +27,9 @@ body {
   padding: .5rem .75rem; display: flex; align-items: center; gap: .5rem; flex-wrap: wrap;
 }
 .topbar-title { font-weight: 600; font-size: .95rem; white-space: nowrap; margin-right: .25rem; }
+.topbar-toggle { display: inline-flex; }
+.topbar-fields { display: none; flex-wrap: wrap; gap: .5rem; align-items: center; }
+.topbar-fields.open { display: flex; }
 .topbar input {
   padding: .35rem .6rem; border: 1px solid var(--border); border-radius: 6px;
   font-size: .8rem; font-family: inherit; background: var(--card);
@@ -71,6 +74,12 @@ body {
 
 /* Main area */
 .main-area { display: flex; flex: 1; overflow: hidden; }
+
+/* Changes panel desktop */
+#changes-panel {
+  width: 280px; min-width: 200px;
+  border-left: 1px solid var(--border); border-right: none;
+}
 
 /* Sidebar */
 .sidebar {
@@ -157,25 +166,27 @@ body {
 <body>
 <div class="app">
   <div class="topbar">
-    <span class="topbar-title">📂 GitHub 文件管理器</span>
-    <input type="password" id="token-input" placeholder="Token (ghp_…)" class="token-field">
-    <button class="btn btn-ghost btn-sm" onclick="toggleTokenVisibility()">👁</button>
-    <span class="sep">|</span>
-    <input type="text" id="user-input" placeholder="用户名" style="width:130px">
-    <button class="btn btn-primary btn-sm" onclick="loadRepos()" id="load-repos-btn">加载账号</button>
-    <div class="combo" id="repo-combo">
-      <input type="text" class="combo-input" id="repo-input" placeholder="搜索或选择仓库…" autocomplete="off" style="width:180px">
-      <span class="cs-toggle" id="repo-cs" onclick="toggleCs('repo')">Aa</span>
-      <div class="combo-list" id="repo-list"></div>
+    <span class="topbar-title">📂 GitHub 文件管理器 <button class="btn btn-ghost btn-sm topbar-toggle" id="topbar-toggle" onclick="toggleTopbar()">⚙️</button></span>
+    <div class="topbar-fields" id="topbar-fields">
+      <input type="password" id="token-input" placeholder="Token (ghp_…)" class="token-field">
+      <button class="btn btn-ghost btn-sm" onclick="toggleTokenVisibility()">👁</button>
+      <span class="sep">|</span>
+      <input type="text" id="user-input" placeholder="用户名" style="width:130px">
+      <button class="btn btn-primary btn-sm" onclick="loadRepos()" id="load-repos-btn">加载账号</button>
+      <div class="combo" id="repo-combo">
+        <input type="text" class="combo-input" id="repo-input" placeholder="搜索或选择仓库…" autocomplete="off" style="width:180px">
+        <span class="cs-toggle" id="repo-cs" onclick="toggleCs('repo')">Aa</span>
+        <div class="combo-list" id="repo-list"></div>
+      </div>
+      <button class="btn btn-primary btn-sm" onclick="loadBranches()" id="load-branches-btn">加载仓库</button>
+      <span class="sep">|</span>
+      <div class="combo" id="branch-combo">
+        <input type="text" class="combo-input" id="branch-input" placeholder="搜索或选择分支…" autocomplete="off" style="width:150px">
+        <span class="cs-toggle" id="branch-cs" onclick="toggleCs('branch')">Aa</span>
+        <div class="combo-list" id="branch-list"></div>
+      </div>
+      <button class="btn btn-primary btn-sm" onclick="loadTree()" id="load-tree-btn">加载分支</button>
     </div>
-    <button class="btn btn-primary btn-sm" onclick="loadBranches()" id="load-branches-btn">加载仓库</button>
-    <span class="sep">|</span>
-    <div class="combo" id="branch-combo">
-      <input type="text" class="combo-input" id="branch-input" placeholder="搜索或选择分支…" autocomplete="off" style="width:150px">
-      <span class="cs-toggle" id="branch-cs" onclick="toggleCs('branch')">Aa</span>
-      <div class="combo-list" id="branch-list"></div>
-    </div>
-    <button class="btn btn-primary btn-sm" onclick="loadTree()" id="load-tree-btn">加载分支</button>
   </div>
   <div class="mobile-tabs" id="mobile-tabs">
     <button class="active" onclick="switchMobileTab('files')">📁 文件</button>
@@ -184,7 +195,7 @@ body {
   </div>
   <div class="main-area">
     <!-- Sidebar: file tree -->
-    <div class="sidebar">
+    <div class="sidebar" id="files-panel">
       <div class="sidebar-header">
         <span id="sidebar-title">文件</span>
         <div class="sidebar-actions">
@@ -218,7 +229,7 @@ body {
       <div id="placeholder" class="placeholder-msg">选择一个文件开始编辑</div>
     </div>
     <!-- Right panel: changes -->
-    <div class="sidebar" id="changes-panel" style="width:280px;min-width:200px;border-left:1px solid var(--border);border-right:none;">
+    <div class="sidebar" id="changes-panel">
       <div class="sidebar-header">
         <span>📋 待提交变更 <span id="changes-count" style="color:var(--primary)"></span></span>
         <div class="sidebar-actions">
@@ -330,27 +341,39 @@ body {
 @media (max-width: 768px) {
   .topbar {
     padding: .4rem .5rem; gap: .35rem;
+    flex-shrink: 0;
   }
-  .topbar-title { font-size: .85rem; width: 100%; margin-bottom: .2rem; }
+  .topbar-title { font-size: .85rem; width: 100%; margin-bottom: 0; display: flex; align-items: center; justify-content: space-between; }
+  .topbar-fields { width: 100%; }
   .topbar .sep { display: none; }
   .topbar input[type="password"], .topbar input[type="text"].token-field { width: 140px; }
   .topbar input[type="text"]#user-input { width: 90px; }
   .combo-input#repo-input, .combo-input#branch-input { width: 120px !important; }
-  .combo-list { width: calc(100vw - 2rem); left: auto; right: 0; }
+  .combo { position: static; }
+  .combo-list {
+    position: fixed; left: .5rem; right: .5rem; width: auto;
+    max-height: 40vh; z-index: 100; top: auto;
+  }
   .btn-sm { padding: .2rem .4rem; font-size: .7rem; }
 
   .mobile-tabs { display: flex; }
 
-  .main-area { flex-direction: column; position: relative; }
+  .main-area { flex-direction: column; flex: 1; overflow: hidden; min-height: 0; }
   .main-area > .sidebar,
   .main-area > .content,
   .main-area > #changes-panel {
-    position: absolute; inset: 0;
     width: 100% !important; min-width: 0 !important;
     border: none !important;
-    display: none;
+    display: none !important;
+    flex: 1; overflow: hidden;
+    flex-direction: column;
+    min-height: 0;
   }
-  .main-area > .mobile-visible { display: flex; }
+  .main-area > .sidebar.mobile-visible,
+  .main-area > .content.mobile-visible,
+  .main-area > #changes-panel.mobile-visible {
+    display: flex !important;
+  }
 
   .editor-footer { flex-wrap: wrap; gap: .35rem; padding: .4rem .5rem; }
   .editor-footer .btn { font-size: .7rem; padding: .3rem .5rem; }

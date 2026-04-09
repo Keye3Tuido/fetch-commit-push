@@ -53,9 +53,19 @@ function validatePath(path) {
   return null;
 }
 
-// ---- Config ----
-function getConfig() { try { return JSON.parse(localStorage.getItem(STORAGE_KEY)) || {}; } catch { return {}; } }
-function setConfig(c) { localStorage.setItem(STORAGE_KEY, JSON.stringify(c)); }
+// ---- Config (token stored in sessionStorage for security) ----
+function getConfig() {
+  try {
+    const stored = JSON.parse(localStorage.getItem(STORAGE_KEY)) || {};
+    stored.token = sessionStorage.getItem('ghfm_token') || stored.token || '';
+    return stored;
+  } catch { return {}; }
+}
+function setConfig(c) {
+  sessionStorage.setItem('ghfm_token', c.token || '');
+  const toStore = { ...c }; delete toStore.token;
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(toStore));
+}
 function readInputs() {
   return {
     token: document.getElementById('token-input').value.trim(),
@@ -107,8 +117,8 @@ async function ghApi(method, path, body) {
   return r.json();
 }
 async function ghApiFetchAll(path) {
-  const results = []; let page = 1;
-  while (true) {
+  const results = []; let page = 1; const MAX_PAGES = 50;
+  while (page <= MAX_PAGES) {
     const sep = path.includes('?') ? '&' : '?';
     const data = await ghApi('GET', `${path}${sep}per_page=100&page=${page}`);
     if (!Array.isArray(data) || data.length === 0) break;
@@ -211,8 +221,20 @@ document.getElementById('branch-input').addEventListener('keydown', e => {
   if (e.key === 'Enter') { e.preventDefault(); closeCombo('branch'); if (e.target.value.trim()) { persistInputs(); loadTree(); } }
   if (e.key === 'Escape') closeCombo('branch');
 });
-function openCombo(id) { document.getElementById(id + '-combo').classList.add('open'); }
-function closeCombo(id) { document.getElementById(id + '-combo').classList.remove('open'); }
+function openCombo(id) {
+  const combo = document.getElementById(id + '-combo');
+  combo.classList.add('open');
+  // Position dropdown on mobile
+  if (window.innerWidth <= 768) {
+    const input = combo.querySelector('.combo-input');
+    const rect = input.getBoundingClientRect();
+    const list = document.getElementById(id + '-list');
+    list.style.top = rect.bottom + 'px';
+  }
+}
+function closeCombo(id) {
+  document.getElementById(id + '-combo').classList.remove('open');
+}
 
 // Close all combos when clicking outside
 document.addEventListener('click', e => {
@@ -231,7 +253,7 @@ async function loadTree() {
   if (pendingChanges.size > 0 && !confirm('有未提交的变更，切换分支将丢失。继续？')) return;
   setStatus('正在加载文件树…');
   treeData = []; expandedDirs.clear(); currentFile = null; pendingChanges.clear();
-  closEditor(); renderChanges();
+  closeEditor(); renderChanges();
   try {
     const data = await ghApi('GET', `/repos/${repo}/git/trees/${c.branch}?recursive=1`);
     treeData = data.tree.filter(i => i.type === 'blob' || i.type === 'tree')
@@ -331,7 +353,7 @@ function onTreeItemClick(node) {
   if (node.type === 'dir') {
     expandedDirs.has(node.path) ? expandedDirs.delete(node.path) : expandedDirs.add(node.path);
     renderTree();
-  } else { openFile(node.path, node.sha); }
+  } else { openFile(node.path); }
 }
 
 // ============================================================
@@ -360,7 +382,7 @@ function doFileSearch(query) {
     if (dir) { const de = document.createElement('span'); de.className = 'sr-dir'; de.textContent = ' — ' + dir; ps.appendChild(de); }
     div.appendChild(ps);
     div.addEventListener('click', () => {
-      openFile(f.path, f.sha);
+      openFile(f.path);
       const segs = f.path.split('/'); let acc = '';
       for (let i = 0; i < segs.length - 1; i++) { acc = acc ? acc + '/' + segs[i] : segs[i]; expandedDirs.add(acc); }
     });
@@ -418,6 +440,7 @@ function showEditor(path) {
   document.getElementById('placeholder').classList.add('hidden');
   updateBreadcrumb(path);
   renderTree();
+  if (window.innerWidth <= 768) switchMobileTab('editor');
 }
 
 // "暂存修改" button: save editor content to pendingChanges
@@ -458,7 +481,7 @@ function revertCurrentFile() {
 function updateBreadcrumb(path) {
   const bc = document.getElementById('breadcrumb'); bc.innerHTML = '';
   const parts = path.split('/'); let acc = '';
-  const root = document.createElement('a'); root.textContent = '🏠'; root.onclick = () => { currentFile = null; closEditor(); }; bc.appendChild(root);
+  const root = document.createElement('a'); root.textContent = '🏠'; root.onclick = () => { currentFile = null; closeEditor(); }; bc.appendChild(root);
   parts.forEach((p, i) => {
     const sep = document.createElement('span'); sep.textContent = ' / '; bc.appendChild(sep);
     acc = acc ? acc + '/' + p : p;
@@ -467,7 +490,7 @@ function updateBreadcrumb(path) {
   });
 }
 
-function closEditor() {
+function closeEditor() {
   document.getElementById('editor-wrap').classList.add('hidden');
   document.getElementById('placeholder').classList.remove('hidden');
   document.getElementById('breadcrumb').innerHTML = '';
@@ -535,8 +558,9 @@ function discardAllChanges() {
 // ============================================================
 // Commit & Push: apply all pending changes in one commit
 // ============================================================
+let isCommitting = false;
 async function commitAndPush() {
-  if (pendingChanges.size === 0) return;
+  if (isCommitting || pendingChanges.size === 0) return;
   const msg = document.getElementById('commit-msg').value.trim();
   if (!msg) { setStatus('请输入 Commit message'); document.getElementById('commit-msg').focus(); return; }
   const desc = document.getElementById('commit-desc').value.trim();
@@ -545,6 +569,7 @@ async function commitAndPush() {
   const repo = fullRepo(); const c = readInputs();
   const btn = document.getElementById('commit-push-btn');
   btn.disabled = true; btn.textContent = '提交中…';
+  isCommitting = true;
   setStatus('正在提交…');
 
   try {
@@ -611,6 +636,7 @@ async function commitAndPush() {
   } catch (e) {
     setStatus('提交失败: ' + e.message);
   } finally {
+    isCommitting = false;
     btn.disabled = pendingChanges.size === 0;
     btn.textContent = '🚀 Commit & Push';
   }
@@ -721,7 +747,7 @@ function stageDelete(node) {
     } else {
       pendingChanges.set(node.path, { type: 'D' });
     }
-    if (currentFile && currentFile.path === node.path) closEditor();
+    if (currentFile && currentFile.path === node.path) closeEditor();
   } else {
     // Delete all files under this dir
     const files = treeData.filter(i => i.type === 'file' && i.path.startsWith(node.path + '/'));
@@ -733,10 +759,9 @@ function stageDelete(node) {
       }
     }
     // Also delete any pending new files under this dir
-    for (const [p, ch] of pendingChanges) {
-      if (ch.type === 'A' && p.startsWith(node.path + '/')) pendingChanges.delete(p);
-    }
-    if (currentFile && currentFile.path.startsWith(node.path + '/')) closEditor();
+    const toRemove = [...pendingChanges.keys()].filter(p => pendingChanges.get(p).type === 'A' && p.startsWith(node.path + '/'));
+    for (const p of toRemove) pendingChanges.delete(p);
+    if (currentFile && currentFile.path.startsWith(node.path + '/')) closeEditor();
   }
   renderChanges(); renderTree();
   setStatus('已标记删除: ' + node.path);
@@ -793,17 +818,12 @@ function promptCopy(node) {
 // Rename/Move/Copy helpers (fetch content, stage locally)
 // ============================================================
 async function getFileContent(path) {
-  // Check pending changes first
-  const pending = pendingChanges.get(path);
-  if (pending && (pending.type === 'A' || pending.type === 'M')) return pending.content;
-  // Fetch from remote
-  const repo = fullRepo(); const c = readInputs();
-  const data = await ghApi('GET', `/repos/${repo}/contents/${path}?ref=${c.branch}`);
-  if (data.encoding === 'base64') {
-    try { return decodeURIComponent(escape(atob(data.content.replace(/\n/g, '')))); }
-    catch { return atob(data.content.replace(/\n/g, '')); }
+  const data = await getFileBlob(path);
+  // getFileBlob returns Uint8Array for binary, string for text
+  if (data instanceof Uint8Array) {
+    return new TextDecoder().decode(data);
   }
-  return data.content || '';
+  return data;
 }
 
 async function stageRenameFile(oldPath, newPath) {
@@ -816,7 +836,7 @@ async function stageRenameFile(oldPath, newPath) {
     pendingChanges.set(oldPath, { type: 'D' });
     pendingChanges.set(newPath, { type: 'A', content });
   }
-  if (currentFile && currentFile.path === oldPath) closEditor();
+  if (currentFile && currentFile.path === oldPath) closeEditor();
 }
 
 async function stageRenameDir(oldDir, newDir) {
@@ -834,7 +854,7 @@ async function stageRenameDir(oldDir, newDir) {
       pendingChanges.set(newPath, { type: 'A', content: ch.content });
     }
   }
-  if (currentFile && currentFile.path.startsWith(oldDir + '/')) closEditor();
+  if (currentFile && currentFile.path.startsWith(oldDir + '/')) closeEditor();
 }
 
 async function stageCopyFile(srcPath, destPath) {
@@ -862,6 +882,11 @@ async function stageCopyDir(srcDir, destDir) {
 // ============================================================
 let uploadTargetDir = ''; // set when uploading into a specific folder
 
+const TEXT_EXT_RE = /\.(txt|md|json|js|ts|py|html|css|xml|yml|yaml|sh|csv|svg|ini|cfg|toml|env|gitignore|gitkeep)$/i;
+function isTextFile(file) {
+  return file.type.startsWith('text/') || TEXT_EXT_RE.test(file.name);
+}
+
 function triggerUpload(dirPath) {
   uploadTargetDir = dirPath || '';
   const input = document.getElementById('file-upload');
@@ -878,13 +903,11 @@ function handleUpload(input) {
   for (const file of files) {
     const path = prefix + file.name;
     const reader = new FileReader();
+    const text = isTextFile(file);
     reader.onload = () => {
-      // Store as base64 for binary files, text for text files
-      const isText = file.type.startsWith('text/') || /\.(txt|md|json|js|ts|py|html|css|xml|yml|yaml|sh|csv|svg|ini|cfg|toml|env|gitignore|gitkeep)$/i.test(file.name);
-      if (isText) {
+      if (text) {
         pendingChanges.set(path, { type: 'A', content: reader.result });
       } else {
-        // Store binary as base64 with a marker
         const base64 = reader.result.split(',')[1] || '';
         pendingChanges.set(path, { type: 'A', content: base64, binary: true });
       }
@@ -894,11 +917,7 @@ function handleUpload(input) {
         setStatus(`已添加 ${count} 个文件`);
       }
     };
-    if (file.type.startsWith('text/') || /\.(txt|md|json|js|ts|py|html|css|xml|yml|yaml|sh|csv|svg|ini|cfg|toml|env|gitignore|gitkeep)$/i.test(file.name)) {
-      reader.readAsText(file);
-    } else {
-      reader.readAsDataURL(file);
-    }
+    text ? reader.readAsText(file) : reader.readAsDataURL(file);
   }
 }
 
@@ -1000,9 +1019,13 @@ document.addEventListener('keydown', e => {
 // ============================================================
 // Mobile tab switching
 // ============================================================
+function toggleTopbar() {
+  document.getElementById('topbar-fields').classList.toggle('open');
+}
+
 function switchMobileTab(tab) {
   const panels = {
-    files: document.querySelector('.main-area > .sidebar'),
+    files: document.getElementById('files-panel'),
     editor: document.querySelector('.main-area > .content'),
     changes: document.getElementById('changes-panel'),
   };
@@ -1016,13 +1039,6 @@ function switchMobileTab(tab) {
   const idx = { files: 0, editor: 1, changes: 2 };
   if (btns[idx[tab]]) btns[idx[tab]].classList.add('active');
 }
-
-// Auto-switch to editor tab on mobile when opening a file
-const _origShowEditor = showEditor;
-showEditor = function(path) {
-  _origShowEditor(path);
-  if (window.innerWidth <= 768) switchMobileTab('editor');
-};
 
 // Initialize mobile: show files tab by default
 if (window.innerWidth <= 768) switchMobileTab('files');
