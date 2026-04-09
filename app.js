@@ -77,6 +77,10 @@ function fullRepo() {
   document.getElementById('user-input').value = c.user || '';
   document.getElementById('repo-input').value = c.repo || '';
   document.getElementById('branch-input').value = c.branch || '';
+  // Auto-load if token and user are cached
+  if (c.token && c.user) {
+    setTimeout(() => loadRepos(), 100);
+  }
 })();
 
 function toggleTokenVisibility() {
@@ -125,15 +129,16 @@ async function loadRepos() {
   btn.disabled = true; btn.textContent = '加载中…';
   setStatus('正在加载仓库列表…');
   try {
-    // Use /user/repos for authenticated user (includes private repos), fallback to /users/:user/repos for others
     const isAuthUser = await ghApi('GET', '/user').then(u => u.login.toLowerCase() === c.user.toLowerCase()).catch(() => false);
     const endpoint = isAuthUser ? '/user/repos?affiliation=owner' : `/users/${c.user}/repos`;
     const data = await ghApiFetchAll(endpoint);
     allRepos = data.map(r => r.name).sort((a, b) => a.localeCompare(b));
     setStatus(`已加载 ${allRepos.length} 个仓库`, c.user);
     renderRepoList(''); openCombo('repo');
+    // Auto-load branches if repo is already filled
+    if (c.repo && allRepos.includes(c.repo)) await loadBranches();
   } catch (e) { setStatus('加载仓库失败: ' + e.message); allRepos = []; }
-  finally { btn.disabled = false; btn.textContent = '加载仓库'; }
+  finally { btn.disabled = false; btn.textContent = '加载账号'; }
 }
 function renderRepoList(filter) {
   const list = document.getElementById('repo-list'); list.innerHTML = '';
@@ -172,7 +177,13 @@ async function loadBranches() {
     setStatus(`已加载 ${allBranches.length} 个分支`, repo);
     renderBranchList(''); openCombo('branch');
     const c = readInputs();
-    if (c.branch && !allBranches.includes(c.branch)) document.getElementById('branch-input').value = '';
+    if (c.branch && !allBranches.includes(c.branch)) {
+      document.getElementById('branch-input').value = '';
+    } else if (c.branch && allBranches.includes(c.branch)) {
+      // Auto-load tree if branch is already filled and valid
+      closeCombo('branch');
+      await loadTree();
+    }
   } catch (e) { setStatus('加载分支失败: ' + e.message); allBranches = []; }
 }
 function renderBranchList(filter) {
@@ -202,6 +213,14 @@ document.getElementById('branch-input').addEventListener('keydown', e => {
 });
 function openCombo(id) { document.getElementById(id + '-combo').classList.add('open'); }
 function closeCombo(id) { document.getElementById(id + '-combo').classList.remove('open'); }
+
+// Close all combos when clicking outside
+document.addEventListener('click', e => {
+  for (const id of ['repo', 'branch']) {
+    const combo = document.getElementById(id + '-combo');
+    if (combo && !combo.contains(e.target)) closeCombo(id);
+  }
+});
 
 // ============================================================
 // File tree
@@ -608,6 +627,7 @@ function showContextMenu(e, node) {
     items.push({ label: '📄 新建文件', action: () => promptNewFile(node.path) });
     items.push({ label: '📁 新建文件夹', action: () => promptNewFolder(node.path) });
     items.push({ label: '📤 上传文件', action: () => triggerUpload(node.path) });
+    items.push({ label: '⬇️ 下载文件夹', action: () => downloadFolder(node.path) });
     items.push({ sep: true });
     items.push({ label: '✏️ 重命名', action: () => promptRename(node) });
     items.push({ label: '📋 复制到…', action: () => promptCopy(node) });
@@ -616,6 +636,7 @@ function showContextMenu(e, node) {
     items.push({ label: '🗑️ 删除', action: () => stageDelete(node), danger: true });
   } else {
     items.push({ label: '📖 打开', action: () => openFile(node.path) });
+    items.push({ label: '⬇️ 下载', action: () => downloadFile(node.path) });
     items.push({ sep: true });
     items.push({ label: '✏️ 重命名', action: () => promptRename(node) });
     items.push({ label: '📋 复制到…', action: () => promptCopy(node) });
@@ -881,6 +902,93 @@ function handleUpload(input) {
   }
 }
 
+// ============================================================
+// File download
+// ============================================================
+async function getFileBlob(path) {
+  const pending = pendingChanges.get(path);
+  let content, isBinary = false;
+
+  if (pending && (pending.type === 'A' || pending.type === 'M')) {
+    content = pending.content;
+    isBinary = !!pending.binary;
+  } else {
+    const repo = fullRepo(); const c = readInputs();
+    const data = await ghApi('GET', `/repos/${repo}/contents/${path}?ref=${c.branch}`);
+    if (data.encoding === 'base64') {
+      content = data.content.replace(/\n/g, '');
+      isBinary = true;
+    } else {
+      content = data.content || '';
+    }
+  }
+
+  if (isBinary) {
+    const bytes = atob(content);
+    const arr = new Uint8Array(bytes.length);
+    for (let i = 0; i < bytes.length; i++) arr[i] = bytes.charCodeAt(i);
+    return arr;
+  }
+  return content;
+}
+
+function triggerBrowserDownload(blob, fileName) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = fileName;
+  document.body.appendChild(a); a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+async function downloadFile(path) {
+  setStatus('正在下载 ' + path + '…');
+  try {
+    const data = await getFileBlob(path);
+    const fileName = path.split('/').pop();
+    const blob = data instanceof Uint8Array
+      ? new Blob([data])
+      : new Blob([data], { type: 'text/plain;charset=utf-8' });
+    triggerBrowserDownload(blob, fileName);
+    setStatus('已下载: ' + fileName);
+  } catch (e) { setStatus('下载失败: ' + e.message); }
+}
+
+function downloadCurrentFile() {
+  if (currentFile) downloadFile(currentFile.path);
+}
+
+async function downloadFolder(dirPath) {
+  const files = treeData.filter(i => i.type === 'file' && i.path.startsWith(dirPath + '/'))
+    .filter(f => !(pendingChanges.has(f.path) && pendingChanges.get(f.path).type === 'D'));
+  // Also include pending new files under this dir
+  for (const [p, ch] of pendingChanges) {
+    if (ch.type === 'A' && p.startsWith(dirPath + '/') && !files.find(f => f.path === p)) {
+      files.push({ path: p, type: 'file' });
+    }
+  }
+  if (!files.length) { setStatus('文件夹为空'); return; }
+
+  const folderName = dirPath.split('/').pop();
+  setStatus(`正在打包 ${folderName}/ (${files.length} 个文件)…`);
+
+  try {
+    const zip = new JSZip();
+    for (let i = 0; i < files.length; i++) {
+      const f = files[i];
+      setStatus(`正在打包 (${i + 1}/${files.length}): ${f.path}`);
+      const data = await getFileBlob(f.path);
+      // Use folder name as root directory inside zip to preserve the original name
+      const relativePath = folderName + '/' + f.path.substring(dirPath.length + 1);
+      zip.file(relativePath, data);
+    }
+    setStatus('正在生成 ZIP…');
+    const blob = await zip.generateAsync({ type: 'blob' });
+    triggerBrowserDownload(blob, folderName + '.zip');
+    setStatus(`已下载: ${folderName}.zip (${files.length} 个文件)`);
+  } catch (e) { setStatus('下载失败: ' + e.message); }
+}
+
 // ---- Keyboard shortcut ----
 document.addEventListener('keydown', e => {
   if ((e.ctrlKey || e.metaKey) && e.key === 's') {
@@ -888,3 +996,33 @@ document.addEventListener('keydown', e => {
     if (currentFile) stageCurrentFile();
   }
 });
+
+// ============================================================
+// Mobile tab switching
+// ============================================================
+function switchMobileTab(tab) {
+  const panels = {
+    files: document.querySelector('.main-area > .sidebar'),
+    editor: document.querySelector('.main-area > .content'),
+    changes: document.getElementById('changes-panel'),
+  };
+  // Remove mobile-visible from all panels
+  Object.values(panels).forEach(p => p.classList.remove('mobile-visible'));
+  // Add to selected
+  if (panels[tab]) panels[tab].classList.add('mobile-visible');
+  // Update tab buttons
+  const btns = document.querySelectorAll('#mobile-tabs button');
+  btns.forEach(b => b.classList.remove('active'));
+  const idx = { files: 0, editor: 1, changes: 2 };
+  if (btns[idx[tab]]) btns[idx[tab]].classList.add('active');
+}
+
+// Auto-switch to editor tab on mobile when opening a file
+const _origShowEditor = showEditor;
+showEditor = function(path) {
+  _origShowEditor(path);
+  if (window.innerWidth <= 768) switchMobileTab('editor');
+};
+
+// Initialize mobile: show files tab by default
+if (window.innerWidth <= 768) switchMobileTab('files');

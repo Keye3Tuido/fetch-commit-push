@@ -162,18 +162,25 @@ body {
     <button class="btn btn-ghost btn-sm" onclick="toggleTokenVisibility()">👁</button>
     <span class="sep">|</span>
     <input type="text" id="user-input" placeholder="用户名" style="width:130px">
-    <button class="btn btn-primary btn-sm" onclick="loadRepos()" id="load-repos-btn">加载仓库</button>
+    <button class="btn btn-primary btn-sm" onclick="loadRepos()" id="load-repos-btn">加载账号</button>
     <div class="combo" id="repo-combo">
-      <input type="text" class="combo-input" id="repo-input" placeholder="搜索或选择仓库…" autocomplete="off" style="width:220px">
+      <input type="text" class="combo-input" id="repo-input" placeholder="搜索或选择仓库…" autocomplete="off" style="width:180px">
       <span class="cs-toggle" id="repo-cs" onclick="toggleCs('repo')">Aa</span>
       <div class="combo-list" id="repo-list"></div>
     </div>
+    <button class="btn btn-primary btn-sm" onclick="loadBranches()" id="load-branches-btn">加载仓库</button>
     <span class="sep">|</span>
     <div class="combo" id="branch-combo">
-      <input type="text" class="combo-input" id="branch-input" placeholder="搜索或选择分支…" autocomplete="off" style="width:180px">
+      <input type="text" class="combo-input" id="branch-input" placeholder="搜索或选择分支…" autocomplete="off" style="width:150px">
       <span class="cs-toggle" id="branch-cs" onclick="toggleCs('branch')">Aa</span>
       <div class="combo-list" id="branch-list"></div>
     </div>
+    <button class="btn btn-primary btn-sm" onclick="loadTree()" id="load-tree-btn">加载分支</button>
+  </div>
+  <div class="mobile-tabs" id="mobile-tabs">
+    <button class="active" onclick="switchMobileTab('files')">📁 文件</button>
+    <button onclick="switchMobileTab('editor')">📝 编辑</button>
+    <button onclick="switchMobileTab('changes')">📋 变更</button>
   </div>
   <div class="main-area">
     <!-- Sidebar: file tree -->
@@ -205,6 +212,7 @@ body {
         <div class="editor-footer">
           <button class="btn btn-primary" onclick="stageCurrentFile()" id="save-btn">💾 暂存修改</button>
           <button class="btn btn-ghost" onclick="revertCurrentFile()" id="revert-btn">↩ 撤销修改</button>
+          <button class="btn btn-ghost" onclick="downloadCurrentFile()" id="download-btn">⬇️ 下载</button>
         </div>
       </div>
       <div id="placeholder" class="placeholder-msg">选择一个文件开始编辑</div>
@@ -305,8 +313,54 @@ body {
 }
 .change-item .ch-undo:hover { background: var(--hover-bg); color: var(--danger); }
 .hidden { display: none; }
+
+/* Mobile tab bar */
+.mobile-tabs {
+  display: none; background: var(--card); border-bottom: 1px solid var(--border);
+  padding: 0; overflow-x: auto;
+}
+.mobile-tabs button {
+  flex: 1; padding: .5rem; border: none; background: none; font-size: .75rem;
+  cursor: pointer; color: var(--text3); border-bottom: 2px solid transparent;
+  white-space: nowrap; font-family: inherit;
+}
+.mobile-tabs button.active { color: var(--primary); border-bottom-color: var(--primary); font-weight: 600; }
+
+/* Mobile responsive */
+@media (max-width: 768px) {
+  .topbar {
+    padding: .4rem .5rem; gap: .35rem;
+  }
+  .topbar-title { font-size: .85rem; width: 100%; margin-bottom: .2rem; }
+  .topbar .sep { display: none; }
+  .topbar input[type="password"], .topbar input[type="text"].token-field { width: 140px; }
+  .topbar input[type="text"]#user-input { width: 90px; }
+  .combo-input#repo-input, .combo-input#branch-input { width: 120px !important; }
+  .combo-list { width: calc(100vw - 2rem); left: auto; right: 0; }
+  .btn-sm { padding: .2rem .4rem; font-size: .7rem; }
+
+  .mobile-tabs { display: flex; }
+
+  .main-area { flex-direction: column; position: relative; }
+  .main-area > .sidebar,
+  .main-area > .content,
+  .main-area > #changes-panel {
+    position: absolute; inset: 0;
+    width: 100% !important; min-width: 0 !important;
+    border: none !important;
+    display: none;
+  }
+  .main-area > .mobile-visible { display: flex; }
+
+  .editor-footer { flex-wrap: wrap; gap: .35rem; padding: .4rem .5rem; }
+  .editor-footer .btn { font-size: .7rem; padding: .3rem .5rem; }
+
+  .modal { min-width: auto; width: calc(100vw - 2rem); }
+  .statusbar { font-size: .65rem; padding: .25rem .5rem; }
+}
 </style>
 
+<script src="https://cdn.jsdelivr.net/npm/jszip@3/dist/jszip.min.js"></script>
 <script src="app.js"></script>
 </body>
 </html>
