@@ -130,6 +130,81 @@ async function ghApiFetchAll(path) {
 }
 
 // ============================================================
+// Unified pending change management
+// All writes to pendingChanges go through these functions.
+// stageFile compares content with remote to determine A/M/skip.
+// Uses Git blob SHA for comparison — the same way Git itself works.
+// ============================================================
+
+async function fetchRemoteContent(filePath) {
+  const repo = fullRepo(); const c = readInputs();
+  return await ghApi('GET', `/repos/${repo}/contents/${filePath}?ref=${c.branch}`);
+}
+
+/**
+ * Compute the Git blob SHA1 for given content.
+ * Git blob = "blob <size>\0<content>" then SHA-1.
+ */
+async function gitBlobSha(contentBytes) {
+  const header = new TextEncoder().encode('blob ' + contentBytes.length + '\0');
+  const combined = new Uint8Array(header.length + contentBytes.length);
+  combined.set(header);
+  combined.set(contentBytes, header.length);
+  const hashBuffer = await crypto.subtle.digest('SHA-1', combined);
+  return Array.from(new Uint8Array(hashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+/**
+ * Stage a file change. Compares with remote SHA to decide type (A/M/skip).
+ * @param {string} filePath
+ * @param {string} content - text content or base64 string for binary
+ * @param {object} [opts] - { binary: bool }
+ * @returns {'A'|'M'|'skip'} the action taken
+ */
+async function stageFile(filePath, content, opts = {}) {
+  const binary = !!opts.binary;
+  const remoteEntry = treeData.find(i => i.type === 'file' && i.path === filePath);
+
+  if (!remoteEntry) {
+    pendingChanges.set(filePath, binary
+      ? { type: 'A', content, binary: true }
+      : { type: 'A', content });
+    return 'A';
+  }
+
+  // Compare using Git blob SHA
+  try {
+    const contentBytes = binary
+      ? Uint8Array.from(atob(content), c => c.charCodeAt(0))
+      : new TextEncoder().encode(content.replace(/\r\n/g, '\n'));
+    const localSha = await gitBlobSha(contentBytes);
+
+    if (localSha === remoteEntry.sha) {
+      pendingChanges.delete(filePath);
+      return 'skip';
+    }
+    pendingChanges.set(filePath, binary
+      ? { type: 'M', content, binary: true, originalSha: remoteEntry.sha }
+      : { type: 'M', content, originalSha: remoteEntry.sha });
+    return 'M';
+  } catch {
+    // SHA computation failed, fall back to treating as modified
+    pendingChanges.set(filePath, binary
+      ? { type: 'M', content, binary: true, originalSha: remoteEntry.sha }
+      : { type: 'M', content, originalSha: remoteEntry.sha });
+    return 'M';
+  }
+}
+
+function stageDelete(filePath) {
+  if (pendingChanges.has(filePath) && pendingChanges.get(filePath).type === 'A') {
+    pendingChanges.delete(filePath);
+  } else {
+    pendingChanges.set(filePath, { type: 'D' });
+  }
+}
+
+// ============================================================
 // Repo & Branch combos (unchanged logic)
 // ============================================================
 async function loadRepos() {
@@ -283,13 +358,13 @@ function buildTreeStructure() {
     }
   }
   // Also add pending new files to tree
+  const treeFilePaths = new Set(treeData.filter(i => i.type === 'file').map(i => i.path));
   for (const [path, ch] of pendingChanges) {
-    if (ch.type === 'A') {
+    if (ch.type === 'A' && !treeFilePaths.has(path)) {
       const parts = path.split('/'); const fn = parts.pop(); const pp = parts.join('/');
       if (!dirMap[pp]) { let cur = ''; for (const p of parts) { const prev = cur; cur = cur ? cur + '/' + p : p; if (!dirMap[cur]) { const n = { name: p, children: [], type: 'dir', path: cur }; dirMap[cur] = n; dirMap[prev].children.push(n); } } }
-      // Only add if not already in tree
       const parent = dirMap[pp];
-      if (parent && !parent.children.find(c => c.path === path)) {
+      if (parent) {
         parent.children.push({ name: fn, type: 'file', path, sha: null });
       }
     }
@@ -444,19 +519,11 @@ function showEditor(path) {
 }
 
 // "暂存修改" button: save editor content to pendingChanges
-function stageCurrentFile() {
+async function stageCurrentFile() {
   if (!currentFile) return;
   const content = document.getElementById('editor').value;
-  const isNew = currentFile.sha === null;
-
-  if (isNew) {
-    pendingChanges.set(currentFile.path, { type: 'A', content });
-  } else if (content === currentFile.originalContent) {
-    // Content reverted to original, remove pending change
-    pendingChanges.delete(currentFile.path);
-  } else {
-    pendingChanges.set(currentFile.path, { type: 'M', content, originalSha: currentFile.sha });
-  }
+  setStatus('正在比较 ' + currentFile.path + '…');
+  await stageFile(currentFile.path, content);
   renderChanges();
   renderTree();
   setStatus('已暂存: ' + currentFile.path);
@@ -659,7 +726,7 @@ function showContextMenu(e, node) {
     items.push({ label: '📋 复制到…', action: () => promptCopy(node) });
     items.push({ label: '📦 移动到…', action: () => promptMove(node) });
     items.push({ sep: true });
-    items.push({ label: '🗑️ 删除', action: () => stageDelete(node), danger: true });
+    items.push({ label: '🗑️ 删除', action: () => stageDeleteNode(node), danger: true });
   } else {
     items.push({ label: '📖 打开', action: () => openFile(node.path) });
     items.push({ label: '⬇️ 下载', action: () => downloadFile(node.path) });
@@ -668,7 +735,7 @@ function showContextMenu(e, node) {
     items.push({ label: '📋 复制到…', action: () => promptCopy(node) });
     items.push({ label: '📦 移动到…', action: () => promptMove(node) });
     items.push({ sep: true });
-    items.push({ label: '🗑️ 删除', action: () => stageDelete(node), danger: true });
+    items.push({ label: '🗑️ 删除', action: () => stageDeleteNode(node), danger: true });
   }
   for (const item of items) {
     if (item.sep) { const d = document.createElement('div'); d.className = 'ctx-menu-sep'; menu.appendChild(d); }
@@ -717,7 +784,7 @@ function promptNewFile(dirPath) {
     const nameErr = validateName(v.name);
     if (nameErr) throw new Error(nameErr);
     const path = prefix + v.name;
-    pendingChanges.set(path, { type: 'A', content: '' });
+    await stageFile(path, '');
     renderChanges(); renderTree();
     setStatus('已添加新文件: ' + path);
     openFile(path);
@@ -732,32 +799,21 @@ function promptNewFolder(dirPath) {
     const nameErr = validateName(v.name);
     if (nameErr) throw new Error(nameErr);
     const path = prefix + v.name + '/.gitkeep';
-    pendingChanges.set(path, { type: 'A', content: '' });
+    await stageFile(path, '');
     renderChanges(); renderTree();
     setStatus('已添加新文件夹: ' + prefix + v.name);
   });
 }
 
 // ---- Delete (stage) ----
-function stageDelete(node) {
+function stageDeleteNode(node) {
   if (node.type === 'file') {
-    // If it's a pending new file, just remove the pending change
-    if (pendingChanges.has(node.path) && pendingChanges.get(node.path).type === 'A') {
-      pendingChanges.delete(node.path);
-    } else {
-      pendingChanges.set(node.path, { type: 'D' });
-    }
+    stageDelete(node.path);
     if (currentFile && currentFile.path === node.path) closeEditor();
   } else {
     // Delete all files under this dir
     const files = treeData.filter(i => i.type === 'file' && i.path.startsWith(node.path + '/'));
-    for (const f of files) {
-      if (pendingChanges.has(f.path) && pendingChanges.get(f.path).type === 'A') {
-        pendingChanges.delete(f.path);
-      } else {
-        pendingChanges.set(f.path, { type: 'D' });
-      }
-    }
+    for (const f of files) stageDelete(f.path);
     // Also delete any pending new files under this dir
     const toRemove = [...pendingChanges.keys()].filter(p => pendingChanges.get(p).type === 'A' && p.startsWith(node.path + '/'));
     for (const p of toRemove) pendingChanges.delete(p);
@@ -818,8 +874,13 @@ function promptCopy(node) {
 // Rename/Move/Copy helpers (fetch content, stage locally)
 // ============================================================
 async function getFileContent(path) {
+  // If pending A or M, use that content directly
+  const pending = pendingChanges.get(path);
+  if (pending && (pending.type === 'A' || pending.type === 'M')) {
+    return pending.content;
+  }
+  // Otherwise fetch from remote (works for D or no pending)
   const data = await getFileBlob(path);
-  // getFileBlob returns Uint8Array for binary, string for text
   if (data instanceof Uint8Array) {
     return new TextDecoder().decode(data);
   }
@@ -828,30 +889,28 @@ async function getFileContent(path) {
 
 async function stageRenameFile(oldPath, newPath) {
   const content = await getFileContent(oldPath);
-  // If it was a pending new file, just move the pending entry
   if (pendingChanges.has(oldPath) && pendingChanges.get(oldPath).type === 'A') {
     pendingChanges.delete(oldPath);
-    pendingChanges.set(newPath, { type: 'A', content });
   } else {
-    pendingChanges.set(oldPath, { type: 'D' });
-    pendingChanges.set(newPath, { type: 'A', content });
+    stageDelete(oldPath);
   }
+  await stageFile(newPath, content);
   if (currentFile && currentFile.path === oldPath) closeEditor();
 }
 
 async function stageRenameDir(oldDir, newDir) {
   const files = treeData.filter(i => i.type === 'file' && i.path.startsWith(oldDir + '/'));
-  // Also include pending new files under oldDir
   const pendingNew = [...pendingChanges.entries()].filter(([p, ch]) => ch.type === 'A' && p.startsWith(oldDir + '/'));
   for (const f of files) {
     const newPath = newDir + f.path.substring(oldDir.length);
     await stageRenameFile(f.path, newPath);
   }
+  const processedPaths = new Set(files.map(f => f.path));
   for (const [p, ch] of pendingNew) {
-    if (!files.find(f => f.path === p)) { // avoid double processing
+    if (!processedPaths.has(p)) {
       const newPath = newDir + p.substring(oldDir.length);
       pendingChanges.delete(p);
-      pendingChanges.set(newPath, { type: 'A', content: ch.content });
+      await stageFile(newPath, ch.content);
     }
   }
   if (currentFile && currentFile.path.startsWith(oldDir + '/')) closeEditor();
@@ -859,7 +918,7 @@ async function stageRenameDir(oldDir, newDir) {
 
 async function stageCopyFile(srcPath, destPath) {
   const content = await getFileContent(srcPath);
-  pendingChanges.set(destPath, { type: 'A', content });
+  await stageFile(destPath, content);
 }
 
 async function stageCopyDir(srcDir, destDir) {
@@ -868,11 +927,10 @@ async function stageCopyDir(srcDir, destDir) {
     const newPath = destDir + f.path.substring(srcDir.length);
     await stageCopyFile(f.path, newPath);
   }
-  // Also copy pending new files
   for (const [p, ch] of pendingChanges) {
     if (ch.type === 'A' && p.startsWith(srcDir + '/')) {
       const newPath = destDir + p.substring(srcDir.length);
-      pendingChanges.set(newPath, { type: 'A', content: ch.content });
+      await stageFile(newPath, ch.content);
     }
   }
 }
@@ -899,22 +957,27 @@ function handleUpload(input) {
   if (!files || !files.length) return;
   const prefix = uploadTargetDir ? uploadTargetDir + '/' : '';
   let count = 0;
+  let added = 0, modified = 0, skipped = 0;
 
   for (const file of files) {
     const path = prefix + file.name;
     const reader = new FileReader();
     const text = isTextFile(file);
-    reader.onload = () => {
-      if (text) {
-        pendingChanges.set(path, { type: 'A', content: reader.result });
-      } else {
-        const base64 = reader.result.split(',')[1] || '';
-        pendingChanges.set(path, { type: 'A', content: base64, binary: true });
-      }
+    reader.onload = async () => {
+      const content = text ? reader.result : (reader.result.split(',')[1] || '');
+      const result = await stageFile(path, content, { binary: !text });
+      if (result === 'A') added++;
+      else if (result === 'M') modified++;
+      else skipped++;
+
       count++;
       if (count === files.length) {
         renderChanges(); renderTree();
-        setStatus(`已添加 ${count} 个文件`);
+        const parts = [];
+        if (added) parts.push(`${added} 个新增`);
+        if (modified) parts.push(`${modified} 个修改`);
+        if (skipped) parts.push(`${skipped} 个无变化已跳过`);
+        setStatus(`已处理: ${parts.join(', ') || '无变更'}`);
       }
     };
     text ? reader.readAsText(file) : reader.readAsDataURL(file);
@@ -981,8 +1044,9 @@ async function downloadFolder(dirPath) {
   const files = treeData.filter(i => i.type === 'file' && i.path.startsWith(dirPath + '/'))
     .filter(f => !(pendingChanges.has(f.path) && pendingChanges.get(f.path).type === 'D'));
   // Also include pending new files under this dir
+  const existingPaths = new Set(files.map(f => f.path));
   for (const [p, ch] of pendingChanges) {
-    if (ch.type === 'A' && p.startsWith(dirPath + '/') && !files.find(f => f.path === p)) {
+    if (ch.type === 'A' && p.startsWith(dirPath + '/') && !existingPaths.has(p)) {
       files.push({ path: p, type: 'file' });
     }
   }
