@@ -877,24 +877,28 @@ async function getFileContent(path) {
   // If pending A or M, use that content directly
   const pending = pendingChanges.get(path);
   if (pending && (pending.type === 'A' || pending.type === 'M')) {
-    return pending.content;
+    return { content: pending.content, binary: !!pending.binary };
   }
   // Otherwise fetch from remote (works for D or no pending)
   const data = await getFileBlob(path);
   if (data instanceof Uint8Array) {
-    return new TextDecoder().decode(data);
+    // 重新编码为 base64 字符串
+    let binary = '';
+    for (let i = 0; i < data.length; i++) binary += String.fromCharCode(data[i]);
+    const base64 = btoa(binary);
+    return { content: base64, binary: true };
   }
-  return data;
+  return { content: data, binary: false };
 }
 
 async function stageRenameFile(oldPath, newPath) {
-  const content = await getFileContent(oldPath);
+  const { content, binary } = await getFileContent(oldPath);
   if (pendingChanges.has(oldPath) && pendingChanges.get(oldPath).type === 'A') {
     pendingChanges.delete(oldPath);
   } else {
     stageDelete(oldPath);
   }
-  await stageFile(newPath, content);
+  await stageFile(newPath, content, { binary });
   if (currentFile && currentFile.path === oldPath) closeEditor();
 }
 
@@ -917,8 +921,8 @@ async function stageRenameDir(oldDir, newDir) {
 }
 
 async function stageCopyFile(srcPath, destPath) {
-  const content = await getFileContent(srcPath);
-  await stageFile(destPath, content);
+  const { content, binary } = await getFileContent(srcPath);
+  await stageFile(destPath, content, { binary });
 }
 
 async function stageCopyDir(srcDir, destDir) {
