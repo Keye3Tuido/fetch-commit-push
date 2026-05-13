@@ -104,6 +104,24 @@ function setStatus(msg, right) {
   if (right !== undefined) document.getElementById('status-right').textContent = right;
 }
 
+// ---- UTF-8 / Base64 helpers (replaces escape/unescape hack) ----
+function textToBase64(text) {
+  return bytesToBase64(new TextEncoder().encode(text));
+}
+
+function base64ToText(base64) {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return new TextDecoder().decode(bytes);
+}
+
+function bytesToBase64(bytes) {
+  let binary = '';
+  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+  return btoa(binary);
+}
+
 // ---- GitHub API ----
 async function ghApi(method, path, body) {
   const c = readInputs();
@@ -341,19 +359,30 @@ async function loadTree() {
 function buildTreeStructure() {
   const root = { name: '', children: [], type: 'dir', path: '' };
   const dirMap = { '': root };
+
+  function ensureDirPath(fullPath) {
+    if (dirMap[fullPath]) return;
+    const parts = fullPath.split('/'); let cur = '';
+    for (const p of parts) {
+      const prev = cur;
+      cur = cur ? cur + '/' + p : p;
+      if (!dirMap[cur]) {
+        const n = { name: p, children: [], type: 'dir', path: cur };
+        dirMap[cur] = n;
+        dirMap[prev].children.push(n);
+      }
+    }
+  }
+
   for (const item of treeData) {
     if (item.type === 'dir') {
-      const parts = item.path.split('/'); let cur = '';
-      for (const p of parts) {
-        const par = cur; cur = cur ? cur + '/' + p : p;
-        if (!dirMap[cur]) { const n = { name: p, children: [], type: 'dir', path: cur, sha: item.sha }; dirMap[cur] = n; dirMap[par].children.push(n); }
-      }
+      ensureDirPath(item.path);
     }
   }
   for (const item of treeData) {
     if (item.type === 'file') {
       const parts = item.path.split('/'); const fn = parts.pop(); const pp = parts.join('/');
-      if (!dirMap[pp]) { let cur = ''; for (const p of parts) { const prev = cur; cur = cur ? cur + '/' + p : p; if (!dirMap[cur]) { const n = { name: p, children: [], type: 'dir', path: cur }; dirMap[cur] = n; dirMap[prev].children.push(n); } } }
+      ensureDirPath(pp);
       dirMap[pp].children.push({ name: fn, type: 'file', path: item.path, sha: item.sha });
     }
   }
@@ -362,7 +391,7 @@ function buildTreeStructure() {
   for (const [path, ch] of pendingChanges) {
     if (ch.type === 'A' && !treeFilePaths.has(path)) {
       const parts = path.split('/'); const fn = parts.pop(); const pp = parts.join('/');
-      if (!dirMap[pp]) { let cur = ''; for (const p of parts) { const prev = cur; cur = cur ? cur + '/' + p : p; if (!dirMap[cur]) { const n = { name: p, children: [], type: 'dir', path: cur }; dirMap[cur] = n; dirMap[prev].children.push(n); } } }
+      ensureDirPath(pp);
       const parent = dirMap[pp];
       if (parent) {
         parent.children.push({ name: fn, type: 'file', path, sha: null });
@@ -436,11 +465,13 @@ function onTreeItemClick(node) {
 // ============================================================
 const fileSearchInput = document.getElementById('file-search');
 let searchDebounce = null;
-fileSearchInput.addEventListener('input', () => {
-  clearTimeout(searchDebounce);
-  searchDebounce = setTimeout(() => { const q = fileSearchInput.value.trim(); q ? doFileSearch(q) : exitFileSearch(); }, 150);
-});
-fileSearchInput.addEventListener('keydown', e => { if (e.key === 'Escape') { fileSearchInput.value = ''; exitFileSearch(); } });
+if (fileSearchInput) {
+  fileSearchInput.addEventListener('input', () => {
+    clearTimeout(searchDebounce);
+    searchDebounce = setTimeout(() => { const q = fileSearchInput.value.trim(); q ? doFileSearch(q) : exitFileSearch(); }, 150);
+  });
+  fileSearchInput.addEventListener('keydown', e => { if (e.key === 'Escape') { fileSearchInput.value = ''; exitFileSearch(); } });
+}
 
 function doFileSearch(query) {
   const files = treeData.filter(i => i.type === 'file' && matchFilter(i.path, query, csFlags.file));
@@ -498,8 +529,7 @@ async function openFile(path) {
     const data = await ghApi('GET', `/repos/${repo}/contents/${path}?ref=${c.branch}`);
     let content;
     if (data.encoding === 'base64') {
-      try { content = decodeURIComponent(escape(atob(data.content.replace(/\n/g, '')))); }
-      catch { content = atob(data.content.replace(/\n/g, '')); }
+      content = base64ToText(data.content.replace(/\n/g, ''));
     } else { content = data.content || ''; }
 
     currentFile = { path, sha: data.sha, originalContent: content };
@@ -675,7 +705,7 @@ async function commitAndPush() {
     for (const [path, info] of modifiedPaths) {
       // Create blob: binary files are already base64, text files need encoding
       const blob = await ghApi('POST', `/repos/${repo}/git/blobs`, {
-        content: info.binary ? info.content : btoa(unescape(encodeURIComponent(info.content))),
+        content: info.binary ? info.content : textToBase64(info.content),
         encoding: 'base64',
       });
       newTreeEntries.push({ path, mode: '100644', type: 'blob', sha: blob.sha });
@@ -814,8 +844,12 @@ function stageDeleteNode(node) {
     // Delete all files under this dir
     const files = treeData.filter(i => i.type === 'file' && i.path.startsWith(node.path + '/'));
     for (const f of files) stageDelete(f.path);
-    // Also delete any pending new files under this dir
-    const toRemove = [...pendingChanges.keys()].filter(p => pendingChanges.get(p).type === 'A' && p.startsWith(node.path + '/'));
+    // Also remove pending additions and renames whose source is under this dir
+    const toRemove = [];
+    for (const [p, ch] of pendingChanges) {
+      if (ch.type === 'A' && p.startsWith(node.path + '/')) toRemove.push(p);
+      else if (ch.type === 'R' && ch.oldPath && ch.oldPath.startsWith(node.path + '/')) toRemove.push(p);
+    }
     for (const p of toRemove) pendingChanges.delete(p);
     if (currentFile && currentFile.path.startsWith(node.path + '/')) closeEditor();
   }
@@ -873,6 +907,11 @@ function promptCopy(node) {
 // ============================================================
 // Rename/Move/Copy helpers (fetch content, stage locally)
 // ============================================================
+const TEXT_EXT_RE = /\.(txt|md|json|js|ts|py|html|css|xml|yml|yaml|sh|csv|svg|ini|cfg|toml|env|gitignore|gitkeep)$/i;
+function isTextFile(file) {
+  return file.type.startsWith('text/') || TEXT_EXT_RE.test(file.name);
+}
+
 async function getFileContent(path) {
   // If pending A or M, use that content directly
   const pending = pendingChanges.get(path);
@@ -882,42 +921,57 @@ async function getFileContent(path) {
   // Otherwise fetch from remote (works for D or no pending)
   const data = await getFileBlob(path);
   if (data instanceof Uint8Array) {
-    // 重新编码为 base64 字符串
-    let binary = '';
-    for (let i = 0; i < data.length; i++) binary += String.fromCharCode(data[i]);
-    const base64 = btoa(binary);
-    return { content: base64, binary: true };
+    // Determine if text by extension
+    const ext = path.split('.').pop().toLowerCase();
+    const isText = TEXT_EXT_RE.test('.' + ext);
+    if (isText) {
+      // Decode raw bytes to proper UTF-8 text
+      return { content: new TextDecoder().decode(data), binary: false };
+    }
+    // Binary file: encode raw bytes to base64
+    return { content: bytesToBase64(data), binary: true };
   }
   return { content: data, binary: false };
 }
 
 async function stageRenameFile(oldPath, newPath) {
   const { content, binary } = await getFileContent(oldPath);
+  // 删除原路径
   if (pendingChanges.has(oldPath) && pendingChanges.get(oldPath).type === 'A') {
     pendingChanges.delete(oldPath);
   } else {
     stageDelete(oldPath);
   }
-  await stageFile(newPath, content, { binary });
+  // 路径拼接修正，防止多/少 '/'
+  let fixedNewPath = newPath.replace(/\/+/g, '/');
+  // 暂存新路径，传递 binary 标记，防止内容乱码
+  await stageFile(fixedNewPath, content, { binary });
   if (currentFile && currentFile.path === oldPath) closeEditor();
 }
 
 async function stageRenameDir(oldDir, newDir) {
-  const files = treeData.filter(i => i.type === 'file' && i.path.startsWith(oldDir + '/'));
-  const pendingNew = [...pendingChanges.entries()].filter(([p, ch]) => ch.type === 'A' && p.startsWith(oldDir + '/'));
+  // 统一处理路径分隔符，防止多/少 '/'
+  const normOldDir = oldDir.replace(/\/+/g, '/');
+  const normNewDir = newDir.replace(/\/+/g, '/');
+  const files = treeData.filter(i => i.type === 'file' && i.path.startsWith(normOldDir + '/'));
+  const pendingNew = [...pendingChanges.entries()].filter(([p, ch]) => ch.type === 'A' && p.startsWith(normOldDir + '/'));
   for (const f of files) {
-    const newPath = newDir + f.path.substring(oldDir.length);
+    const rel = f.path.substring(normOldDir.length);
+    let newPath = normNewDir + rel;
+    newPath = newPath.replace(/\/+/g, '/');
     await stageRenameFile(f.path, newPath);
   }
   const processedPaths = new Set(files.map(f => f.path));
   for (const [p, ch] of pendingNew) {
     if (!processedPaths.has(p)) {
-      const newPath = newDir + p.substring(oldDir.length);
+      const rel = p.substring(normOldDir.length);
+      let newPath = normNewDir + rel;
+      newPath = newPath.replace(/\/+/g, '/');
       pendingChanges.delete(p);
-      await stageFile(newPath, ch.content);
+      await stageFile(newPath, ch.content, { binary: !!ch.binary });
     }
   }
-  if (currentFile && currentFile.path.startsWith(oldDir + '/')) closeEditor();
+  if (currentFile && currentFile.path.startsWith(normOldDir + '/')) closeEditor();
 }
 
 async function stageCopyFile(srcPath, destPath) {
@@ -926,15 +980,17 @@ async function stageCopyFile(srcPath, destPath) {
 }
 
 async function stageCopyDir(srcDir, destDir) {
-  const files = treeData.filter(i => i.type === 'file' && i.path.startsWith(srcDir + '/'));
+  const normSrcDir = srcDir.replace(/\/+/g, '/');
+  const normDestDir = destDir.replace(/\/+/g, '/');
+  const files = treeData.filter(i => i.type === 'file' && i.path.startsWith(normSrcDir + '/'));
   for (const f of files) {
-    const newPath = destDir + f.path.substring(srcDir.length);
+    const newPath = normDestDir + f.path.substring(normSrcDir.length);
     await stageCopyFile(f.path, newPath);
   }
   for (const [p, ch] of pendingChanges) {
-    if (ch.type === 'A' && p.startsWith(srcDir + '/')) {
-      const newPath = destDir + p.substring(srcDir.length);
-      await stageFile(newPath, ch.content);
+    if (ch.type === 'A' && p.startsWith(normSrcDir + '/')) {
+      const newPath = normDestDir + p.substring(normSrcDir.length);
+      await stageFile(newPath, ch.content, { binary: !!ch.binary });
     }
   }
 }
@@ -943,11 +999,6 @@ async function stageCopyDir(srcDir, destDir) {
 // File upload
 // ============================================================
 let uploadTargetDir = ''; // set when uploading into a specific folder
-
-const TEXT_EXT_RE = /\.(txt|md|json|js|ts|py|html|css|xml|yml|yaml|sh|csv|svg|ini|cfg|toml|env|gitignore|gitkeep)$/i;
-function isTextFile(file) {
-  return file.type.startsWith('text/') || TEXT_EXT_RE.test(file.name);
-}
 
 function triggerUpload(dirPath) {
   uploadTargetDir = dirPath || '';
