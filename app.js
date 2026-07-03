@@ -122,6 +122,12 @@ function bytesToBase64(bytes) {
   return btoa(binary);
 }
 
+// Normalize newlines to LF. Mirrors how a <textarea> reports its value, so
+// comparisons between editor content and stored/remote content stay consistent.
+function normalizeNewlines(text) {
+  return (text == null ? '' : text).replace(/\r\n?/g, '\n');
+}
+
 // ---- GitHub API ----
 async function ghApi(method, path, body) {
   const c = readInputs();
@@ -188,6 +194,19 @@ async function stageFile(filePath, content, opts = {}) {
       ? { type: 'A', content, binary: true }
       : { type: 'A', content });
     return 'A';
+  }
+
+  // If the caller supplied the original content (the editor flow), compare
+  // against it directly. This is line-ending tolerant, which matters because the
+  // <textarea> normalizes CRLF/CR to LF on read while Git stores the raw bytes —
+  // comparing the editor value to Git's blob SHA would flag unchanged CRLF files.
+  if (!binary && opts.originalContent !== undefined) {
+    if (normalizeNewlines(content) === normalizeNewlines(opts.originalContent)) {
+      pendingChanges.delete(filePath);
+      return 'skip';
+    }
+    pendingChanges.set(filePath, { type: 'M', content, originalSha: remoteEntry.sha });
+    return 'M';
   }
 
   // Compare using Git blob SHA
@@ -351,8 +370,12 @@ async function loadTree() {
     const data = await ghApi('GET', `/repos/${repo}/git/trees/${c.branch}?recursive=1`);
     treeData = data.tree.filter(i => i.type === 'blob' || i.type === 'tree')
       .map(i => ({ path: i.path, type: i.type === 'tree' ? 'dir' : 'file', sha: i.sha }));
-    renderTree();
-    setStatus(`已加载 ${treeData.length} 个项目`, `${repo} @ ${c.branch}`);
+ renderTree();
+ if (data.truncated) {
+ setStatus(`⚠️ 仓库过大，仅显示部分文件（${treeData.length} 项，已被截断）`, `${repo} @ ${c.branch}`);
+ } else {
+ setStatus(`已加载 ${treeData.length} 个项目`, `${repo} @ ${c.branch}`);
+ }
   } catch (e) { setStatus('加载失败: ' + e.message); document.getElementById('tree').innerHTML = ''; }
 }
 
@@ -507,7 +530,10 @@ async function openFile(path) {
     const editorContent = document.getElementById('editor').value;
     const pending = pendingChanges.get(currentFile.path);
     const savedContent = pending ? pending.content : currentFile.originalContent;
-    if (editorContent !== savedContent) {
+    // Compare with newlines normalized: the <textarea> normalizes CRLF/CR to LF
+    // when read, so a raw comparison reports false "unsaved" changes for files
+    // whose remote content uses CRLF line endings.
+    if (normalizeNewlines(editorContent) !== normalizeNewlines(savedContent)) {
       if (!confirm('编辑器中有未暂存的修改，确定切换？')) return;
     }
   }
@@ -553,10 +579,10 @@ async function stageCurrentFile() {
   if (!currentFile) return;
   const content = document.getElementById('editor').value;
   setStatus('正在比较 ' + currentFile.path + '…');
-  await stageFile(currentFile.path, content);
+  const result = await stageFile(currentFile.path, content, { originalContent: currentFile.originalContent });
   renderChanges();
   renderTree();
-  setStatus('已暂存: ' + currentFile.path);
+  setStatus(result === 'skip' ? '无变化，未暂存: ' + currentFile.path : '已暂存: ' + currentFile.path);
 }
 
 // "撤销修改" button: revert editor to original/pending content
@@ -675,53 +701,41 @@ async function commitAndPush() {
     const headSha = ref.object.sha;
     const headCommit = await ghApi('GET', `/repos/${repo}/git/commits/${headSha}`);
     const baseTreeSha = headCommit.tree.sha;
-
-    // 2. Get full current tree
-    const fullTree = await ghApi('GET', `/repos/${repo}/git/trees/${baseTreeSha}?recursive=1`);
-    const existingEntries = fullTree.tree.filter(i => i.type === 'blob' || i.type === 'tree');
-
-    // 3. Build new tree entries
-    // Start with all existing blobs (not trees, git rebuilds those)
+    // 2. Build only the changed entries. Unlisted paths are inherited from
+    // base_tree, so we never enumerate the full tree — this avoids silent file
+    // loss when the tree API truncates its response on very large repos.
     const deletedPaths = new Set();
     const modifiedPaths = new Map(); // path -> {content, binary}
-
     for (const [path, ch] of pendingChanges) {
       if (ch.type === 'D') {
         deletedPaths.add(path);
       } else if (ch.type === 'M' || ch.type === 'A') {
         modifiedPaths.set(path, { content: ch.content, binary: !!ch.binary });
-      } else if (ch.type === 'R') {
-        deletedPaths.add(ch.oldPath);
-        modifiedPaths.set(path, { content: ch.content, binary: !!ch.binary });
       }
     }
-
-    // Filter existing blobs, removing deleted ones
-    const newTreeEntries = existingEntries
-      .filter(i => i.type === 'blob' && !deletedPaths.has(i.path) && !modifiedPaths.has(i.path))
-      .map(i => ({ path: i.path, mode: i.mode, type: 'blob', sha: i.sha }));
-
-    // Add modified/new files
+    const treeEntries = [];
+    // Deletions: a null sha removes the path from the inherited base_tree.
+    for (const path of deletedPaths) {
+      treeEntries.push({ path, mode: '100644', type: 'blob', sha: null });
+    }
+    // Additions / modifications: upload a blob, reference its sha.
     for (const [path, info] of modifiedPaths) {
       // Create blob: binary files are already base64, text files need encoding
       const blob = await ghApi('POST', `/repos/${repo}/git/blobs`, {
         content: info.binary ? info.content : textToBase64(info.content),
         encoding: 'base64',
       });
-      newTreeEntries.push({ path, mode: '100644', type: 'blob', sha: blob.sha });
+      treeEntries.push({ path, mode: '100644', type: 'blob', sha: blob.sha });
     }
-
-    // 4. Create new tree
-    const newTree = await ghApi('POST', `/repos/${repo}/git/trees`, { tree: newTreeEntries });
-
-    // 5. Create commit
+    // 3. Create the new tree based on the current one (unlisted paths inherited).
+    const newTree = await ghApi('POST', `/repos/${repo}/git/trees`, { base_tree: baseTreeSha, tree: treeEntries });
+    // 4. Create commit
     const newCommit = await ghApi('POST', `/repos/${repo}/git/commits`, {
       message: fullMsg,
       tree: newTree.sha,
       parents: [headSha],
     });
-
-    // 6. Update ref (push)
+    // 5. Update ref (push)
     await ghApi('PATCH', `/repos/${repo}/git/refs/heads/${c.branch}`, { sha: newCommit.sha });
 
     // Success: clear changes and reload
@@ -836,19 +850,49 @@ function promptNewFolder(dirPath) {
 }
 
 // ---- Delete (stage) ----
-function stageDeleteNode(node) {
+// List every file path under a directory by walking the contents API. We do NOT
+// rely on the in-memory treeData here: on large repos the tree API truncates its
+// response, so treeData can be incomplete and a folder would only be partially
+// deleted. The contents API is walked per-directory (1000-entry limit each),
+// which sidesteps whole-tree truncation.
+async function listAllFilesUnder(dirPath) {
+  const repo = fullRepo(); const c = readInputs();
+  const out = [];
+  async function walk(p) {
+    const entries = await ghApi('GET', `/repos/${repo}/contents/${p}?ref=${c.branch}`);
+    if (!Array.isArray(entries)) return;
+    for (const e of entries) {
+      if (e.type === 'dir') await walk(e.path);
+      else if (e.type === 'file') out.push(e.path);
+    }
+  }
+  await walk(dirPath);
+  return out;
+}
+
+async function stageDeleteNode(node) {
   if (node.type === 'file') {
     stageDelete(node.path);
     if (currentFile && currentFile.path === node.path) closeEditor();
   } else {
-    // Delete all files under this dir
-    const files = treeData.filter(i => i.type === 'file' && i.path.startsWith(node.path + '/'));
-    for (const f of files) stageDelete(f.path);
-    // Also remove pending additions and renames whose source is under this dir
+    // Fetch the complete file list from the API (treeData may be truncated).
+    setStatus('正在获取文件夹内容: ' + node.path + '…');
+    let files = [];
+    try {
+      files = await listAllFilesUnder(node.path);
+    } catch (e) {
+      // 404 = folder exists only locally (never committed); not an error, just
+      // fall through to drop pending additions. Anything else is a real failure.
+      if (!/未找到|404/.test(e.message)) {
+        setStatus('删除失败，无法获取文件夹内容: ' + e.message);
+        return;
+      }
+    }
+    for (const p of files) stageDelete(p);
+    // Drop pending additions under this dir (never committed, nothing to delete remotely).
     const toRemove = [];
     for (const [p, ch] of pendingChanges) {
       if (ch.type === 'A' && p.startsWith(node.path + '/')) toRemove.push(p);
-      else if (ch.type === 'R' && ch.oldPath && ch.oldPath.startsWith(node.path + '/')) toRemove.push(p);
     }
     for (const p of toRemove) pendingChanges.delete(p);
     if (currentFile && currentFile.path.startsWith(node.path + '/')) closeEditor();
